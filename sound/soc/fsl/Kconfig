@@ -26,6 +26,15 @@ config SND_SOC_FSL_SAI
 	  This option is only useful for out-of-tree drivers since
 	  in-tree drivers select it automatically.
 
+config SND_SOC_MT_UAC2_SAI_CLOCK
+	tristate "UAC2 gadget async feedback via SAI bit counter"
+	depends on SND_SOC_FSL_SAI
+	help
+	  Platform driver that samples an SAI transmit bit counter (TBCTN)
+	  every 100 ms and writes the measured LRCLK rate as a pitch value
+	  to the f_uac2 gadget's "Capture Pitch 1000000" ALSA control.
+	  Decouples USB audio async feedback from userspace audio daemon state.
+
 config SND_SOC_FSL_MQS
 	tristate "Medium Quality Sound (MQS) module support"
 	depends on SND_SOC_FSL_SAI

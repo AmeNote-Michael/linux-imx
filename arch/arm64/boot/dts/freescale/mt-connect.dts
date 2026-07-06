@@ -831,3 +831,10 @@
 		>;
 	};
 };
+
+/ {
+	uac2_sai_clock: uac2-sai-clock {
+		compatible = "mt,uac2-sai-clock";
+		ref-sai = <&sai1>;
+	};
+};
