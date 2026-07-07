@@ -2,15 +2,23 @@
 /*
  * fsl_uac2_sai_clock.c - SAI bit-counter driven UAC2 async feedback
  *
- * Samples an SAI transmit bit counter (TBCTN) at a fixed interval and writes
+ * Samples the SAI receive bit counter (RBCTN) at a fixed interval and writes
  * the measured LRCLK frequency as a pitch ratio to the "Capture Pitch 1000000"
- * ALSA control on every ci_hdrc USB audio gadget card.  This lets f_uac2's
- * isochronous feedback endpoint track the hardware reference clock without
- * depending on userspace audio daemon state.
+ * ALSA control on every UAC2_Gadget card.  This lets f_uac2's isochronous
+ * feedback endpoint track the hardware reference clock without depending on
+ * userspace audio daemon state.
  *
  * The reference SAI is specified via the "ref-sai" device tree phandle.
- * It must have TCSR[TERE] asserted before probe (so TBCTN is already
- * counting) and its VERID must report TSTMP_EN support.
+ * The RX side is used because the RX pins are unused in hardware and RERE
+ * is never touched by ALSA (no capture stream on the interprocessor card).
+ * The default fsl_sai sync mode (synchronous[RX]=true) routes TX bit clock
+ * and frame sync internally to RX, so RBCTN counts the same hardware-locked
+ * BCLK as TBCTN would.  TERE must be asserted (TX running) for the bit clock
+ * to reach the RX counter; when the TX is idle, delta_bits==0 and the pitch
+ * write is skipped so the last valid value is preserved.
+ *
+ * A permanent pm_runtime reference is held on the SAI device so the
+ * functional clock stays enabled and RTCTL[RSEN] is not lost across suspend.
  */
 #include <linux/delay.h>
 #include <linux/kthread.h>
@@ -19,6 +27,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <sound/control.h>
 #include <sound/core.h>
 #include "fsl_sai.h"
@@ -30,14 +39,14 @@
 #define POLL_MS		100
 
 #define PITCH_CTL_NAME	"Capture Pitch 1000000"
-#define CARD_MATCH	"ci_hdrc"
+#define CARD_MATCH	"UAC2_Gadget"
 
 struct uac2_sai_clock_priv {
 	struct device		*dev;
-	struct device		*sai_dev;	/* get_device() ref, kept until remove */
+	struct device		*sai_dev;	/* get_device() + pm_runtime ref, kept until remove */
 	struct fsl_sai		*sai;
 	struct task_struct	*task;
-	u32			 b0;		/* previous TBCTN snapshot */
+	u32			 b0;		/* previous RBCTN snapshot */
 	ktime_t			 t0;		/* ktime at b0 snapshot */
 };
 
@@ -96,13 +105,13 @@ static int uac2_sai_clock_thread(void *data)
 		if (kthread_should_stop())
 			break;
 
-		regmap_read(sai->regmap, FSL_SAI_TBCTN, &b1);
+		regmap_read(sai->regmap, FSL_SAI_RBCTN, &b1);
 		t1 = ktime_get();
 
 		delta_bits = b1 - priv->b0;	/* u32 subtraction is wrap-safe */
 		delta_ns   = ktime_to_ns(ktime_sub(t1, priv->t0));
 
-		if (unlikely(delta_ns == 0))
+		if (unlikely(delta_ns == 0 || delta_bits == 0))
 			goto next;
 
 		lrclk_hz = div64_u64((u64)delta_bits * NSEC_PER_SEC,
@@ -127,6 +136,7 @@ static int uac2_sai_clock_probe(struct platform_device *pdev)
 	struct platform_device *sai_pdev;
 	struct fsl_sai *sai;
 	struct uac2_sai_clock_priv *priv;
+	unsigned int ofs;
 	int ret;
 
 	sai_np = of_parse_phandle(np, "ref-sai", 0);
@@ -152,36 +162,64 @@ static int uac2_sai_clock_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	/* Enable transmit bit counter */
-	ret = regmap_update_bits(sai->regmap, FSL_SAI_TTCTL,
-				 FSL_SAI_xTCTL_TSEN, FSL_SAI_xTCTL_TSEN);
-	if (ret) {
+	/*
+	 * SAI is pm_runtime suspended at probe time (no active PCM stream yet).
+	 * Acquire a permanent runtime reference so the functional clock stays
+	 * on and RTCTL[RSEN] is never lost.  Released in remove().
+	 */
+	ret = pm_runtime_get_sync(&sai_pdev->dev);
+	if (ret < 0) {
 		put_device(&sai_pdev->dev);
-		return ret;
+		return dev_err_probe(dev, ret, "failed to wake SAI\n");
 	}
+
+	ofs = sai->soc_data->reg_offset;
+
+	/*
+	 * Enable receive timestamp counting.  RCSR[RERE] enables the receiver
+	 * so RBCTN increments on each bit clock edge.  RTCTL[RSEN] arms the
+	 * counter.  The default fsl_sai sync mode (synchronous[RX]=true) sets
+	 * RCR2[SYNC] so RX uses the TX bit clock; no external RX pins needed.
+	 * ALSA never opens a capture stream on the interprocessor card so RERE
+	 * is safe to assert here permanently.
+	 */
+	ret = regmap_update_bits(sai->regmap, FSL_SAI_RCSR(ofs),
+				 FSL_SAI_CSR_TERE, FSL_SAI_CSR_TERE);
+	if (ret)
+		goto err_pm;
+
+	ret = regmap_update_bits(sai->regmap, FSL_SAI_RTCTL,
+				 FSL_SAI_xTCTL_TSEN, FSL_SAI_xTCTL_TSEN);
+	if (ret)
+		goto err_pm;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv) {
-		put_device(&sai_pdev->dev);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_pm;
 	}
 
 	priv->dev     = dev;
-	priv->sai_dev = &sai_pdev->dev;	/* keep ref from of_find_device_by_node() */
+	priv->sai_dev = &sai_pdev->dev;	/* keep get_device() + pm_runtime refs */
 	priv->sai     = sai;
-	regmap_read(sai->regmap, FSL_SAI_TBCTN, &priv->b0);
+	regmap_read(sai->regmap, FSL_SAI_RBCTN, &priv->b0);
 	priv->t0 = ktime_get();
 
 	platform_set_drvdata(pdev, priv);
 
 	priv->task = kthread_run(uac2_sai_clock_thread, priv, "uac2-sai-clock");
 	if (IS_ERR(priv->task)) {
-		put_device(priv->sai_dev);
-		return PTR_ERR(priv->task);
+		ret = PTR_ERR(priv->task);
+		goto err_pm;
 	}
 
-	dev_info(dev, "started: SAI bit counter -> UAC2 pitch (100 ms poll)\n");
+	dev_info(dev, "started: SAI RX bit counter -> UAC2 pitch (100 ms poll)\n");
 	return 0;
+
+err_pm:
+	pm_runtime_put_sync(&sai_pdev->dev);
+	put_device(&sai_pdev->dev);
+	return ret;
 }
 
 static int uac2_sai_clock_remove(struct platform_device *pdev)
@@ -189,6 +227,7 @@ static int uac2_sai_clock_remove(struct platform_device *pdev)
 	struct uac2_sai_clock_priv *priv = platform_get_drvdata(pdev);
 
 	kthread_stop(priv->task);
+	pm_runtime_put_sync(priv->sai_dev);
 	put_device(priv->sai_dev);
 	return 0;
 }
