@@ -12,6 +12,7 @@
 
 #include <linux/usb/audio.h>
 #include <linux/usb/audio-v2.h>
+#include <linux/extclkin.h>
 #include <linux/module.h>
 
 #include "u_audio.h"
@@ -1330,6 +1331,18 @@ afunc_bind(struct usb_configuration *cfg, struct usb_function *fn)
 	}
 	agdev->params.req_number = uac2_opts->req_number;
 	agdev->params.fb_max = uac2_opts->fb_max;
+#if IS_REACHABLE(CONFIG_EXTCLKIN_GPT)
+	/*
+	 * Both capture and playback pitch are disciplined to the same
+	 * external reference clock unconditionally -- there's no per-instance
+	 * configuration here since every f_uac2 instance on a board with this
+	 * clock source wired up should be locked to the same physical clock.
+	 * On any build where EXTCLKIN_GPT isn't reachable, this is compiled
+	 * out entirely and get_pitch_source stays NULL, preserving the
+	 * original ALSA-control-only pitch behavior.
+	 */
+	agdev->params.get_pitch_source = extclkin_gpt_read_raw;
+#endif
 
 	if (FUOUT_EN(uac2_opts) || FUIN_EN(uac2_opts))
     agdev->notify = afunc_notify;
