@@ -48,12 +48,12 @@
 #include <linux/types.h>
 #include <linux/io.h>
 #include <linux/timekeeping.h>
-#include <linux/mutex.h>
-#include <linux/preempt.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
+#include <linux/extclkin.h>
 
 /* Requires GPL compatible license for module */
 #define DRIVER_LICENSE "GPL"
@@ -143,8 +143,16 @@ static char readBuf[READ_BUFFER_SIZE];
 static struct clk *gpt_clk;
 static struct device *extclkin_dev; // Global device pointer for logging
 
-/* Protect state against multiple readers */
-DEFINE_MUTEX(accessTimer);
+/*
+ * Protects overflowCount and the count/rollover capture below. A spinlock
+ * (not a sleeping mutex) so the same lock can serialize both the char-device
+ * read path (process context) and in-kernel callers of
+ * extclkin_gpt_read_raw() from interrupt/softirq context -- get_count()
+ * clears the hardware rollover flag as a side effect of reading it, so any
+ * two callers racing without a shared lock could steal/miscount rollovers
+ * against each other.
+ */
+static DEFINE_SPINLOCK(extclkinLock);
 /* This state must be protected against multiple users */
 static u32 overflowCount = 0;
 
@@ -255,6 +263,57 @@ static inline u32 get_count(u8 *rollover)
 }
 
 /*
+ * Atomically captures a (host monotonic ns, rollover-adjusted external clock
+ * ns) pair under extclkinLock. Safe to call from process or interrupt/softirq
+ * context -- spin_lock_irqsave() covers both.
+ */
+static void capture_locked(u64 *host_ns, u64 *ref_ns)
+{
+	u8 rollover;
+	u32 count;
+	u64 nsPerCount;
+	unsigned long flags;
+
+	spin_lock_irqsave(&extclkinLock, flags);
+
+	/* Capture host monotonic raw clock to reference timer value against */
+	/* Do this first as it's quick */
+	*host_ns = ktime_get_raw_ns();
+	/* Get the timer/counter value and rollover status */
+	count = get_count(&rollover);
+
+	/* handle rollover condition */
+	if (rollover) {
+		overflowCount++;
+		dev_dbg(extclkin_dev, "Device %s: rollover detected, count %u.\n", DEVICE_NAME, overflowCount);
+	}
+
+	/* Derived from frequency as 1s / 1ns / frequency = 10^9 / 10^7 = 100 for freq = 10 MHz */
+	nsPerCount = 1000000000UL / frequency;
+
+	/* Calculate the audio time using overflow, count and above value */
+	*ref_ns = (((u64)overflowCount * (1ULL << 32)) + (u64)count) * nsPerCount;
+
+	spin_unlock_irqrestore(&extclkinLock, flags);
+}
+
+/*
+ * Exported for in-kernel consumers that need this pair from atomic context
+ * (eg. a USB gadget driver disciplining its sample clock to this external
+ * reference on every ISO completion) and can't go through the /dev/extclkin
+ * char device below, which reuses this same helper.
+ */
+int extclkin_gpt_read_raw(u64 *host_ns, u64 *ref_ns)
+{
+	if (!timerMem)
+		return -ENODEV;
+
+	capture_locked(host_ns, ref_ns);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(extclkin_gpt_read_raw);
+
+/*
  * Called when a process tries to open the device file.
  * eg cat /dev/DEVICE_NAME
  */
@@ -289,11 +348,7 @@ static ssize_t device_read(struct file *filp, /* ref: include/linux/fs.h */
 	)
 {
 	ssize_t bytesRead; // retval
-	u8 rollover; // rollover occurred?
-	u32 count; // GPT count
 	u64 host_ns, audio_ns; // times
-	u64 nsPerCount; // frequency multiplier
-	unsigned long flags; // flags for saving IRQ state
 
 
 	dev_dbg(extclkin_dev, "Device %s read length %lu pos %lld offset %lld\n", DEVICE_NAME, length, filp->f_pos, *offset);
@@ -303,37 +358,7 @@ static ssize_t device_read(struct file *filp, /* ref: include/linux/fs.h */
 		return 0;
 	}
 
-	/* Prevent access to timer and rollover status changing overflow count from multiple accessors */
-	mutex_lock(&accessTimer);
-	/* Want to ensure the clock access are as close to each other as possible */
-	preempt_disable();
-	/* Let's also disable interrupts, just to be safe */
-	local_irq_save(flags);
-
-	/* Capture host monotonic raw clock to reference timer value against */
-	/* Do this first as it's quick */
-	host_ns = ktime_get_raw_ns();
-	/* Get the timer/counter value and rollover status */
-	count = get_count(&rollover);
-
-	/* and re-enable them */
-	local_irq_restore(flags);
-	/* Can be pre-empted again now */
-	preempt_enable();
-
-	/* handle rollover condition */
-	if (rollover) {
-		overflowCount++;
-		dev_dbg(extclkin_dev, "Device %s: rollover detected, count %u.\n", DEVICE_NAME, overflowCount);
-	}
-	/* Finished with exclusivity */
-	mutex_unlock(&accessTimer);
-
-	/* Derived from frequency as 1s / 1ns / frequency = 10^9 / 10^7 = 100 for freq = 10 MHz */
-	nsPerCount = 1000000000UL / frequency;
-
-	/* Calculate the audio time using overflow, count and above value */
-	audio_ns = (((u64)overflowCount * (1ULL << 32)) + (u64) count) * nsPerCount;
+	capture_locked(&host_ns, &audio_ns);
 
 	// print string into internal buffer
 	bytesRead = snprintf(readBuf, READ_BUFFER_SIZE, "%" xstr(NS_VALUE_MAX_DIGITS) "llu\t%" xstr(NS_VALUE_MAX_DIGITS) "llu\n", host_ns, audio_ns);
