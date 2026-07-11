@@ -55,6 +55,18 @@ struct uac_params {
 
 	int req_number; /* number of preallocated requests */
 	int fb_max;	/* upper frequency drift feedback limit per-mil */
+
+	/*
+	 * Optional external pitch source (eg. a hardware clock reference
+	 * driver), returning a (host monotonic ns, reference clock ns) pair.
+	 * NULL preserves today's behavior: pitch is only ever set via the
+	 * "Capture Pitch"/"Playback Pitch" ALSA controls. When set, u_audio.c
+	 * recomputes and reasserts pitch autonomously from this source on
+	 * every ISO completion, and writes to those ALSA controls become
+	 * inert (see u_audio_pitch_put() in u_audio.c) so no external writer
+	 * can fight the kernel-driven value.
+	 */
+	int (*get_pitch_source)(u64 *host_ns, u64 *ref_ns);
 };
 
 struct g_audio {

@@ -13,6 +13,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -22,6 +23,16 @@
 #include <linux/usb/audio.h>
 
 #include "u_audio.h"
+
+/*
+ * Minimum interval between autonomous pitch recomputes from
+ * params->get_pitch_source (see u_audio_update_pitch_from_source() below),
+ * to avoid quantization noise from tiny deltas between back-to-back ISO
+ * completions -- analogous to the sync window a userspace-only
+ * implementation would need, just far tighter since this runs continuously
+ * in-kernel instead of once a second.
+ */
+#define PITCH_RECOMPUTE_MIN_NS (10ULL * NSEC_PER_MSEC)
 
 #define BUFF_SIZE_MAX	(PAGE_SIZE * 16)
 #define PRD_SIZE_MAX	PAGE_SIZE
@@ -49,6 +60,15 @@ struct uac_rtd_params {
 
 	unsigned int pitch;	/* Stream pitch ratio to 1000000 */
 	unsigned int max_psize;	/* MaxPacketSize of endpoint */
+
+	/*
+	 * Last sample read from params->get_pitch_source and the host_ns it
+	 * was taken at, for u_audio_update_pitch_from_source(). Protected by
+	 * `lock`, same as `pitch` itself.
+	 */
+	u64 pitch_host_ns;
+	u64 pitch_ref_ns;
+	bool pitch_sample_valid;
 
 	struct usb_request **reqs;
 
@@ -146,6 +166,62 @@ static void u_audio_set_fback_frequency(enum usb_device_speed speed,
 	*(__le32 *)buf = cpu_to_le32(ff);
 }
 
+/*
+ * Recomputes and reasserts prm->pitch from params->get_pitch_source, when
+ * set. Called from u_audio_iso_complete() (playback and capture completions
+ * alike), so this runs continuously at ISO-interval cadence (~1ms) rather
+ * than relying on a periodic userspace writer -- making the kernel the sole
+ * authoritative source for pitch. A no-op when get_pitch_source is NULL,
+ * preserving today's ALSA-control-only behavior for any other UAC2 gadget
+ * use.
+ *
+ * Context: interrupt/softirq (atomic), same as its caller.
+ */
+static void u_audio_update_pitch_from_source(struct uac_rtd_params *prm)
+{
+	struct snd_uac_chip *uac = prm->uac;
+	struct uac_params *params = &uac->audio_dev->params;
+	u64 host_ns, ref_ns, dh, dr;
+	unsigned int pitch, pitch_min, pitch_max;
+	unsigned long flags;
+
+	if (!params->get_pitch_source)
+		return;
+
+	if (params->get_pitch_source(&host_ns, &ref_ns))
+		return;
+
+	spin_lock_irqsave(&prm->lock, flags);
+
+	if (!prm->pitch_sample_valid) {
+		prm->pitch_host_ns = host_ns;
+		prm->pitch_ref_ns = ref_ns;
+		prm->pitch_sample_valid = true;
+		spin_unlock_irqrestore(&prm->lock, flags);
+		return;
+	}
+
+	dh = host_ns - prm->pitch_host_ns;
+	if (dh < PITCH_RECOMPUTE_MIN_NS) {
+		spin_unlock_irqrestore(&prm->lock, flags);
+		return;
+	}
+	dr = ref_ns - prm->pitch_ref_ns;
+
+	/* pitch = nominal * (reference clock rate / host clock rate) */
+	pitch = (unsigned int) div64_u64(1000000ULL * dr, dh);
+
+	pitch_min = (1000 - FBACK_SLOW_MAX) * 1000;
+	pitch_max = (1000 + params->fb_max) * 1000;
+	pitch = clamp(pitch, pitch_min, pitch_max);
+
+	prm->pitch = pitch;
+	prm->pitch_host_ns = host_ns;
+	prm->pitch_ref_ns = ref_ns;
+
+	spin_unlock_irqrestore(&prm->lock, flags);
+}
+
 static void u_audio_iso_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	unsigned int pending;
@@ -175,6 +251,8 @@ static void u_audio_iso_complete(struct usb_ep *ep, struct usb_request *req)
 	if (status)
 		pr_debug("%s: iso_complete status(%d) %d/%d\n",
 			__func__, status, req->actual, req->length);
+
+	u_audio_update_pitch_from_source(prm);
 
 	substream = prm->ss;
 
@@ -654,6 +732,7 @@ int u_audio_start_capture(struct g_audio *audio_dev)
 	 * be meauserd at start of playback
 	 */
 	prm->pitch = 1000000;
+	prm->pitch_sample_valid = false;
 	u_audio_set_fback_frequency(audio_dev->gadget->speed, ep,
 				    prm->srate, prm->pitch,
 				    req_fback->buf);
@@ -700,6 +779,7 @@ int u_audio_start_playback(struct g_audio *audio_dev)
 	 * Always start with original frequency
 	 */
 	prm->pitch = 1000000;
+	prm->pitch_sample_valid = false;
 
 	/* pre-calculate the playback endpoint's interval */
 	if (gadget->speed == USB_SPEED_FULL)
@@ -902,6 +982,15 @@ static int u_audio_pitch_put(struct snd_kcontrol *kcontrol,
 	unsigned int val;
 	unsigned int pitch_min, pitch_max;
 	int change = 0;
+
+	/*
+	 * Kernel-autonomous pitch discipline (params->get_pitch_source) owns
+	 * this value once set -- external writes (a userspace daemon, or a
+	 * USB audio stack's own hardware rate-matching against this same
+	 * control) are silently ignored rather than raced against.
+	 */
+	if (params->get_pitch_source)
+		return 0;
 
 	pitch_min = (1000 - FBACK_SLOW_MAX) * 1000;
 	pitch_max = (1000 + params->fb_max) * 1000;
